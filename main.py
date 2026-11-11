@@ -9,14 +9,19 @@ High-capacity social video downloader bot.
 import asyncio
 import ctypes
 import gc
+import html
 import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
 import yt_dlp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -52,6 +57,12 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 1))
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
 MAX_BYTES = 2000 * 1024 * 1024  # Telegram's 2 GB upload limit (regular accounts)
 QUALITY_OPTIONS = [1080, 720, 480, 320]
+MAX_GALLERY_ITEMS = int(os.environ.get("MAX_GALLERY_ITEMS", 20))  # per post
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 PENDING_TTL = 3600  # seconds a quality menu stays valid
 SUPPORTED = ("youtube.com", "youtu.be", "instagram.com", "pinterest.", "pin.it")
 URL_RE = re.compile(r"https?://\S+")
@@ -63,7 +74,8 @@ log = logging.getLogger("dlbot")
 
 tele: TelegramClient | None = None  # created in post_init (needs a running loop)
 SEM: asyncio.Semaphore | None = None
-COOKIES_PATH: str | None = None
+COOKIES_PATH: str | None = None  # from COOKIES_TXT (YouTube / general)
+IG_COOKIES_PATH: str | None = None  # from INSTAGRAM_COOKIES_TXT
 
 
 # --------------------------------------------------------------------------- #
@@ -157,7 +169,14 @@ def free_memory() -> None:
 # --------------------------------------------------------------------------- #
 # yt-dlp (runs in worker threads)
 # --------------------------------------------------------------------------- #
-def base_opts() -> dict:
+def cookies_for(url: str) -> str | None:
+    """Instagram links use INSTAGRAM_COOKIES_TXT (falls back to COOKIES_TXT)."""
+    if "instagram.com" in url.lower() and IG_COOKIES_PATH:
+        return IG_COOKIES_PATH
+    return COOKIES_PATH
+
+
+def base_opts(url: str = "") -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -168,17 +187,104 @@ def base_opts() -> dict:
         "fragment_retries": 10,
         "socket_timeout": 30,
     }
-    if COOKIES_PATH:
-        opts["cookiefile"] = COOKIES_PATH
+    cookies = cookies_for(url)
+    if cookies:
+        opts["cookiefile"] = cookies
     return opts
 
 
 def fetch_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True}) as ydl:
+    with yt_dlp.YoutubeDL({**base_opts(url), "skip_download": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     if info.get("entries"):  # carousel / playlist-like -> first item
         info = next((e for e in info["entries"] if e), info)
     return info
+
+
+def is_post_url(url: str) -> bool:
+    """Single Instagram post/reel or Pinterest pin (not profiles or boards)."""
+    u = url.lower()
+    return bool(
+        re.search(r"instagram\.com/(?:[^/]+/)?(p|reel|reels|tv)/", u)
+        or re.search(r"pinterest\.[a-z.]+/pin/", u)
+        or "pin.it/" in u
+    )
+
+
+def url_ext(u: str) -> str:
+    return os.path.splitext(urlparse(u).path)[1].lower()
+
+
+def list_gallery_urls(url: str) -> list[str]:
+    """Direct media URLs (all images + videos of the post) via gallery-dl."""
+    cmd = [sys.executable, "-m", "gallery_dl", "-g", "--range", f"1-{MAX_GALLERY_ITEMS}"]
+    cookies = cookies_for(url)
+    if cookies:
+        cmd += ["--cookies", cookies]
+    cmd.append(url)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip().startswith("http")]
+
+
+def stream_to_disk(url: str, dest: str) -> None:
+    """Download in 1 MB chunks straight to disk (never the whole file in RAM)."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
+        shutil.copyfileobj(resp, out, 1024 * 1024)
+
+
+def fetch_pin_image(url: str) -> tuple[list[str], str]:
+    """Image-only pins have no video formats. Read the page's og:image instead."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:  # follows pin.it redirects
+        page = resp.read(1_500_000).decode("utf-8", "ignore")
+
+    def meta(prop: str) -> str | None:
+        for pat in (
+            rf'<meta[^>]+property=["\']{prop}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{prop}["\']',
+        ):
+            m = re.search(pat, page)
+            if m:
+                return html.unescape(m.group(1))
+        return None
+
+    image = meta("og:image")
+    candidates = []
+    if image:
+        candidates.append(re.sub(r"/\d+x/", "/originals/", image))  # full quality
+        candidates.append(image)  # safe fallback
+    return candidates, meta("og:title") or ""
+
+
+async def send_pin_image(msg, status, url: str) -> bool:
+    """Send an image pin straight from Pinterest's CDN (no disk, no RAM)."""
+    try:
+        candidates, title = await asyncio.to_thread(fetch_pin_image, url)
+        for image_url in candidates:
+            try:
+                await msg.reply_photo(photo=image_url, caption=title[:200])
+            except TelegramError:
+                try:
+                    await msg.reply_document(document=image_url, caption=title[:200])
+                except TelegramError:
+                    continue
+            try:
+                await status.delete()
+            except TelegramError:
+                pass
+            return True
+    except Exception as exc:
+        log.warning("Pin image fallback failed: %s", exc)
+    return False
 
 
 def quality_options(info: dict) -> list[int]:
@@ -201,7 +307,7 @@ def download_video(url: str, height: int, job_dir: str, hook) -> tuple[str, dict
         else f"bv*[height<={height}]+ba/b[height<={height}]/b"
     )
     opts = {
-        **base_opts(),
+        **base_opts(url),
         "format": fmt,
         "format_sort": ["res", "vcodec:h264", "acodec:m4a"],  # Telegram-friendly mp4
         "merge_output_format": "mp4",
@@ -268,7 +374,7 @@ async def upload_video(path: str, info: dict, status, target: int):
 # --------------------------------------------------------------------------- #
 # Job runner
 # --------------------------------------------------------------------------- #
-async def process(bot, chat_id: int, status, url: str, height: int) -> None:
+async def _process(bot, chat_id: int, status, url: str, height: int) -> None:
     loop = asyncio.get_running_loop()
     job_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
     os.makedirs(job_dir, exist_ok=True)
@@ -324,6 +430,85 @@ async def process(bot, chat_id: int, status, url: str, height: int) -> None:
         await safe_edit(status, f"❌ Uploaded, but delivery failed: {clean_error(exc)}")
 
 
+async def process(bot, chat_id: int, status, url: str, height: int) -> None:
+    try:
+        await _process(bot, chat_id, status, url, height)
+    finally:
+        free_memory()  # after delivery (or failure): release leftover RAM
+
+
+async def process_gallery(bot, chat_id: int, status, urls: list[str]) -> None:
+    """Instagram/Pinterest posts: send every image and video, albums of up to 10."""
+    target = STORAGE_CHANNEL_ID or chat_id
+
+    batches, album = [], []
+    for u in urls:
+        if url_ext(u) in IMAGE_EXTS:
+            album.append(u)
+            if len(album) == 10:
+                batches.append(album)
+                album = []
+        else:  # videos / gifs go one by one
+            if album:
+                batches.append(album)
+                album = []
+            batches.append([u])
+    if album:
+        batches.append(album)
+
+    done = 0
+    try:
+        async with SEM:
+            for batch in batches:
+                job_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
+                os.makedirs(job_dir, exist_ok=True)
+                span = f"{done + 1}-{done + len(batch)} of {len(urls)}"
+                try:
+                    await safe_edit(status, f"⬇️ Downloading {span}…")
+                    paths = []
+                    for i, u in enumerate(batch):
+                        p = os.path.join(job_dir, f"{i}{url_ext(u) or '.bin'}")
+                        await asyncio.to_thread(stream_to_disk, u, p)
+                        if os.path.getsize(p) > MAX_BYTES:
+                            raise RuntimeError("File is larger than Telegram's 2 GB limit.")
+                        paths.append(p)
+
+                    await safe_edit(status, f"⬆️ Uploading {span}…")
+                    if len(paths) > 1:
+                        sent = await tele.send_file(target, paths, force_document=False)
+                    elif url_ext(batch[0]) in IMAGE_EXTS:
+                        sent = [await tele.send_file(target, paths[0], force_document=False)]
+                    else:
+                        sent = [await upload_video(paths[0], {}, status, target)]
+                finally:
+                    wipe_dir(job_dir)  # files gone the moment this batch is uploaded/failed
+                    free_memory()
+
+                if STORAGE_CHANNEL_ID:
+                    ids = [m.id for m in sent]
+                    await bot.copy_messages(
+                        chat_id=chat_id, from_chat_id=STORAGE_CHANNEL_ID, message_ids=ids
+                    )
+                    try:
+                        await tele.delete_messages(STORAGE_CHANNEL_ID, ids)
+                    except Exception as exc:
+                        log.warning("Couldn't delete storage messages: %s", exc)
+                done += len(batch)
+
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    except Exception as exc:
+        log.exception("Gallery job failed")
+        hint = ""
+        if isinstance(exc, ValueError) and "input entity" in str(exc):
+            hint = "\nSet STORAGE_CHANNEL_ID (see README) so the userbot can deliver files."
+        await safe_edit(
+            status, f"❌ Failed after {done}/{len(urls)} items: {clean_error(exc)}{hint}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Telegram handlers
 # --------------------------------------------------------------------------- #
@@ -344,9 +529,29 @@ async def on_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     status = await msg.reply_text("🔎 Reading link…")
+
+    # Instagram posts / Pinterest pins: grab ALL images + videos of the post.
+    # A lone video still goes to the quality menu below.
+    if is_post_url(url):
+        try:
+            gallery = await asyncio.to_thread(list_gallery_urls, url)
+        except Exception as exc:
+            log.warning("gallery-dl failed: %s", exc)
+            gallery = []
+        lone_video = len(gallery) == 1 and url_ext(gallery[0]) not in IMAGE_EXTS
+        if gallery and not lone_video:
+            await safe_edit(status, f"📥 Found {len(gallery)} item(s)…")
+            context.application.create_task(
+                process_gallery(context.bot, msg.chat_id, status, gallery)
+            )
+            return
+
     try:
         info = await asyncio.to_thread(fetch_info, url)
     except Exception as exc:
+        if "No video formats" in str(exc) and "pin" in url.lower():
+            if await send_pin_image(msg, status, url):
+                return
         await safe_edit(status, f"❌ Couldn't read that link.\n{clean_error(exc)}")
         return
 
@@ -419,13 +624,19 @@ async def post_shutdown(app: Application) -> None:
 
 
 def setup_cookies() -> None:
-    """Optional: paste a Netscape cookies.txt into the COOKIES_TXT variable."""
-    global COOKIES_PATH
+    """Optional: paste Netscape cookies.txt text into COOKIES_TXT (YouTube etc.)
+    and/or INSTAGRAM_COOKIES_TXT (Instagram only)."""
+    global COOKIES_PATH, IG_COOKIES_PATH
     raw = os.environ.get("COOKIES_TXT")
     if raw:
         COOKIES_PATH = "/tmp/cookies.txt"
         with open(COOKIES_PATH, "w") as f:
             f.write(raw)
+    raw_ig = os.environ.get("INSTAGRAM_COOKIES_TXT")
+    if raw_ig:
+        IG_COOKIES_PATH = "/tmp/cookies_instagram.txt"
+        with open(IG_COOKIES_PATH, "w") as f:
+            f.write(raw_ig)
 
 
 def main() -> None:
