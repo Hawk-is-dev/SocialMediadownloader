@@ -11,6 +11,7 @@ import ctypes
 import gc
 import html
 import logging
+import math
 import os
 import re
 import shutil
@@ -34,7 +35,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 
@@ -57,6 +58,7 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 1))
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
 MAX_BYTES = 2000 * 1024 * 1024  # Telegram's 2 GB upload limit (regular accounts)
 QUALITY_OPTIONS = [1080, 720, 480, 320]
+SPLIT_PART_MB = int(os.environ.get("SPLIT_PART_MB", 450))  # target size of each part
 MAX_GALLERY_ITEMS = int(os.environ.get("MAX_GALLERY_ITEMS", 20))  # per post
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 UA = (
@@ -74,6 +76,7 @@ log = logging.getLogger("dlbot")
 
 tele: TelegramClient | None = None  # created in post_init (needs a running loop)
 SEM: asyncio.Semaphore | None = None
+bot_tele: TelegramClient | None = None  # bot-token MTProto client (big files from users)
 COOKIES_PATH: str | None = None  # from COOKIES_TXT (YouTube / general)
 IG_COOKIES_PATH: str | None = None  # from INSTAGRAM_COOKIES_TXT
 
@@ -514,7 +517,8 @@ async def process_gallery(bot, chat_id: int, status, urls: list[str]) -> None:
 # --------------------------------------------------------------------------- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Send me a YouTube, Instagram or Pinterest link and I'll let you pick the quality."
+        "Send me a YouTube, Instagram or Pinterest link and I'll let you pick the quality.\n\n"
+        f"Or send me a big video file and I'll split it into ~{SPLIT_PART_MB} MB parts."
     )
 
 
@@ -601,10 +605,125 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # --------------------------------------------------------------------------- #
+# Split big videos sent TO the bot into ~SPLIT_PART_MB parts
+# --------------------------------------------------------------------------- #
+def is_video_upload(e) -> bool:
+    if not e.is_private or not e.file:
+        return False
+    return bool(e.video) or (e.file.mime_type or "").startswith("video/")
+
+
+def tele_progress(status, label: str):
+    throttle = Throttle(3.0)
+
+    async def cb(current: int, total: int) -> None:
+        pct = current * 100 / total if total else 0
+        if throttle.ready(force=current >= total):
+            try:
+                await status.edit(
+                    f"{label}: {pct:.0f}% [{progress_bar(pct)}]\n"
+                    f"{human(current)} / {human(total)}"
+                )
+            except Exception:
+                pass
+
+    return cb
+
+
+async def run_cmd(*cmd: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
+
+
+async def on_video_upload(event) -> None:
+    size = event.file.size or 0
+    part_bytes = SPLIT_PART_MB * 1024 * 1024
+    if size > MAX_BYTES:
+        await event.reply("❌ This file is over 2 GB, I can't process it.")
+        return
+    if size <= part_bytes * 1.1:
+        await event.reply(f"✅ This video is only {human(size)}, no need to split it.")
+        return
+
+    parts = math.ceil(size / part_bytes)
+    job_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
+    os.makedirs(job_dir, exist_ok=True)
+    status = await event.reply(f"⏳ Got {human(size)}. Will split into {parts} parts…")
+    try:
+        async with SEM:
+            try:
+                ext = event.file.ext or ".mp4"
+                src = await bot_tele.download_media(
+                    event.message,
+                    file=os.path.join(job_dir, "src" + ext),
+                    progress_callback=tele_progress(status, "⬇️ Downloading"),
+                )
+                rc, out, err = await run_cmd(
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1", src,
+                )
+                if rc != 0 or not out.strip():
+                    raise RuntimeError("Couldn't read the video (ffprobe failed).")
+                duration = float(out.strip().splitlines()[0])
+                part_dur = duration / parts
+                out_ext = ".mp4" if ext.lower() in (".mp4", ".mov", ".m4v") else ext
+
+                for i in range(parts):
+                    out_path = os.path.join(job_dir, f"part{i + 1}{out_ext}")
+                    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{i * part_dur:.3f}", "-i", src]
+                    if i < parts - 1:
+                        cmd += ["-t", f"{part_dur:.3f}"]
+                    cmd += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                            "-avoid_negative_ts", "make_zero"]
+                    if out_ext in (".mp4", ".mov"):
+                        cmd += ["-movflags", "+faststart"]
+                    cmd.append(out_path)
+                    await safe_tele_edit(status, f"✂️ Cutting part {i + 1}/{parts}…")
+                    rc, _, err = await run_cmd(*cmd)
+                    if rc != 0:
+                        raise RuntimeError(f"ffmpeg failed: {err[-200:]}")
+                    try:
+                        await bot_tele.send_file(
+                            event.chat_id,
+                            out_path,
+                            caption=f"Part {i + 1}/{parts}",
+                            supports_streaming=True,
+                            force_document=False,
+                            progress_callback=tele_progress(status, f"⬆️ Part {i + 1}/{parts}"),
+                        )
+                    finally:
+                        try:
+                            os.remove(out_path)  # part deleted right after it is sent
+                        except FileNotFoundError:
+                            pass
+            finally:
+                wipe_dir(job_dir)  # source + anything left, success or failure
+                free_memory()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await event.reply(f"✅ Done: {parts} parts sent.")
+    except Exception as exc:
+        log.exception("Split job failed")
+        await safe_tele_edit(status, f"❌ Failed: {clean_error(exc)}")
+
+
+async def safe_tele_edit(status, text: str) -> None:
+    try:
+        await status.edit(text)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Lifecycle
 # --------------------------------------------------------------------------- #
 async def post_init(app: Application) -> None:
-    global tele, SEM
+    global tele, SEM, bot_tele
     SEM = asyncio.Semaphore(MAX_CONCURRENT)
     tele = TelegramClient(
         StringSession(SESSION_STRING), API_ID, API_HASH,
@@ -617,10 +736,21 @@ async def post_init(app: Application) -> None:
     me = await tele.get_me()
     log.info("Userbot logged in as %s", me.first_name)
 
+    # Second MTProto client logged in as the BOT itself: can download/send 2 GB files
+    bot_tele = TelegramClient(
+        StringSession(), API_ID, API_HASH, connection_retries=5, flood_sleep_threshold=60
+    )
+    await bot_tele.start(bot_token=BOT_TOKEN)
+    bot_tele.add_event_handler(
+        on_video_upload, events.NewMessage(incoming=True, func=is_video_upload)
+    )
+
 
 async def post_shutdown(app: Application) -> None:
     if tele:
         await tele.disconnect()
+    if bot_tele:
+        await bot_tele.disconnect()
 
 
 def setup_cookies() -> None:

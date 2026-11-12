@@ -2,5 +2,6 @@ python-telegram-bot>=21.0,<23.0
 telethon>=1.36.0
 yt-dlp[default]
 gallery-dl
+hachoir
 # optional: makes Telethon uploads/downloads much faster (remove if it fails to build)
 cryptg
